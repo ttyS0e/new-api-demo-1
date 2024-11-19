@@ -1,0 +1,205 @@
+name: pull-request
+on:
+  - pull_request
+
+jobs:
+  lint-api-specs:
+    environment:
+      name: "dev"
+
+    runs-on: ubuntu-latest
+
+    container:
+      image: kong/inso:8.6.1
+      options: "--user root --cpus 1"  # run as root doesn't matter, we can't do any damage to GitHub
+      volumes:
+        - ./:/repository
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inso Lint
+        run: |
+          for API_SPEC_PATH in /repository/apis/*.yaml; do
+            export API_SPEC_FILENAME=$(basename $API_SPEC_PATH)
+
+            echo "==========================" >> lint.txt
+            echo "Linting $API_SPEC_FILENAME" >> lint.txt
+            echo "==========================" >> lint.txt
+
+            inso lint spec $API_SPEC_PATH >> lint.txt
+          done
+
+          echo "-> Producing pull request comment"
+
+          cat <<EOF > lint-comment.txt
+          
+          Lint results for all API specs:
+
+          \`\`\`
+          $(cat lint.txt)
+          \`\`\`
+
+          EOF
+
+      - name: PR Comment
+        uses: actions/github-script@v5
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            const fs = require('fs')
+            const comment = fs.readFileSync('/repository/lint-comment.txt', "utf8")
+            console.log(`json string ${comment}`)
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            })
+
+  diff-control-plane:
+    environment:
+      name: "dev"
+
+    env:
+      KONNECT_API_KEY_DEV: ${{ secrets.KONNECT_API_KEY_DEV }}
+      KONNECT_CONTROL_PLANE_NAME_DEV: ${{ vars.KONNECT_CONTROL_PLANE_NAME_DEV }}
+      KONNECT_REGION: ${{ vars.KONNECT_REGION }}
+      API_TAG: ${{ github.event.repository.name }}
+
+    runs-on: ubuntu-latest
+
+    container:
+      image: kong/deck:v1.35.0
+      options: "--user root --cpus 1"
+      volumes:
+        - ./:/repository
+    steps:
+      - uses: actions/checkout@v4
+      - name: OpenAPI to Kong
+        run: |
+          mkdir -p /repository/output/
+
+          echo "-> Generating decks from all API specs"
+
+          for API_SPEC_PATH in /repository/apis/*.yaml; do
+            export API_SPEC_FILENAME=$(basename $API_SPEC_PATH)
+
+            deck file openapi2kong \
+              -s $API_SPEC_PATH \
+              -o /repository/output/$API_SPEC_FILENAME \
+              --select-tag $API_TAG
+
+            echo "-> Genarated Kong config from ${API_SPEC_FILENAME}"
+          done
+
+      - name: Stream In Plugins
+        uses: mikefarah/yq@v4.41.1
+        with:
+          cmd: |
+            for API_SPEC_PATH in apis/*.yaml; do
+              export API_SPEC_FILENAME=$(basename $API_SPEC_PATH)
+
+              if [ -f "plugins/$API_SPEC_FILENAME/service.yaml" ];
+              then
+                echo "-> We have a SERVICE plugins file for $API_SPEC_FILENAME"
+              
+                # Get the service name
+                export SERVICE_NAME=$(yq eval '.services[0].name' output/$API_SPEC_FILENAME)
+
+                echo "--> Inserting service name '$SERVICE_NAME' onto each service.yaml plugin"
+                yq eval -i '.plugins.[].service |= strenv(SERVICE_NAME)' plugins/$API_SPEC_FILENAME/service.yaml
+
+                echo "--> Adding API tag to all service plugins"
+                yq eval -i '.plugins[].tags = [env(API_TAG)]' plugins/$API_SPEC_FILENAME/service.yaml
+
+                echo "--> Moving service plugins into output ready directory"
+                mv plugins/$API_SPEC_FILENAME/service.yaml output/service-plugins.$API_SPEC_FILENAME
+              fi
+
+              if [ -f "plugins/$API_SPEC_FILENAME/routes.yaml" ];
+              then
+                echo "-> We have a ROUTES plugins file for $API_SPEC_FILENAME"
+
+                PLUGINS=$(yq e -o=j -I=0 '.plugins[]' plugins/$API_SPEC_FILENAME/routes.yaml)
+
+                export i=0
+
+                while IFS=\= read -r PLUGIN; do
+                export X_KONG_NAME=$(echo "$PLUGIN" | yq e '.x-kong-name' -)
+          
+                if [ ! "$X_KONG_NAME" == "null" ];
+                then
+                  # look for the operation in the spec, and parse the route name from it
+                  echo "---> Finding OAS operation by x-kong-name '${X_KONG_NAME}'"
+                  export ROUTE_PATH=$(yq e '.paths | with_entries(select(.*.*.x-kong-name == env(X_KONG_NAME))) | keys | .[0] | sub("(-|\.|_|/|{|}| )", "-") | sub("(--)", "-") | downcase' $API_SPEC_PATH)
+                  export ROUTE_PATH="${ROUTE_PATH:1}"
+                  export ROUTE_PATH="${ROUTE_PATH::-1}"
+                  export X_KONG_NAME_REPLACED=$(echo "$PLUGIN" | yq e '.x-kong-name | sub("(-|\.|_| )", "-") | downcase' -)
+
+                  export ROUTE_NAME="${SERVICE_NAME}_${ROUTE_PATH}_${X_KONG_NAME_REPLACED}"
+                            
+                  echo "--> Parsed route name as ${ROUTE_NAME} - attaching back to plugin"
+          
+                  yq eval -i '.plugins[env(i)].route = strenv(ROUTE_NAME)' plugins/$API_SPEC_FILENAME/routes.yaml
+                  yq eval -i 'del(.plugins[env(i)].x-kong-name)' plugins/$API_SPEC_FILENAME/routes.yaml
+                  export i=$((i+1))
+                else
+                  # old-fashioned way
+                  export OPERATION_ID_REF=$(echo "$PLUGIN" | yq e '.operationId | sub("(-|\.|_| )", "-") | downcase' -)
+                  export ROUTE_NAME="${SERVICE_NAME}_${OPERATION_ID_REF}"
+          
+                  echo "--> Parsed route name as ${ROUTE_NAME} - attaching back to plugin"
+          
+                  yq eval -i '.plugins[env(i)].route = strenv(ROUTE_NAME)' plugins/$API_SPEC_FILENAME/routes.yaml
+                  yq eval -i 'del(.plugins[env(i)].operationId)' plugins/$API_SPEC_FILENAME/routes.yaml
+                  export i=$((i+1))
+                fi
+              done <<EOF
+            $PLUGINS
+            EOF
+
+              echo "--> Adding API tag to all route plugins"
+              yq eval -i '.plugins[].tags = [env(API_TAG)]' plugins/$API_SPEC_FILENAME/routes.yaml
+
+              mv plugins/$API_SPEC_FILENAME/routes.yaml output/routes-plugins.$API_SPEC_FILENAME
+              fi
+            done
+
+      - name: Deck Diff
+        run: |
+          echo "-> Diff'ing against control plane '${KONNECT_CONTROL_PLANE_NAME_DEV}' in region '${KONNECT_REGION}'"
+
+          deck --konnect-addr="https://${KONNECT_REGION}.api.konghq.com" \
+               --konnect-token="${KONNECT_API_KEY_DEV}" \
+               --konnect-control-plane-name="${KONNECT_CONTROL_PLANE_NAME_DEV}" \
+               --select-tag="${API_TAG}" \
+               gateway diff /repository/output >> out.txt
+
+          echo "-> Producing pull request comment"
+
+          cat <<EOF > comment.txt
+          This is a diff against Konnect NONPROD!
+
+          Please make sure all of the necessary approvals are in place before merging.
+
+          \`\`\`
+          $(cat out.txt)
+          \`\`\`
+
+          EOF
+
+      - name: PR Comment
+        uses: actions/github-script@v5
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            const fs = require('fs')
+            const comment = fs.readFileSync('/repository/comment.txt', "utf8")
+            console.log(`json string ${comment}`)
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            })

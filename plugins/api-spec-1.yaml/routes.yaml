@@ -1,0 +1,16 @@
+_format_version: "3.0"
+
+plugins:
+- name: rate-limiting
+  operationId: "echoPost"
+  config:
+    minute: 60
+- name: pre-function
+  # operationId: "echoGet"
+  x-kong-name: "jack-echo_GET"
+  config:
+    access:
+    - |
+      kong.log.warn("per-route pre-function")
+
+# echo-server-with-dashes-with-underscores-with-dots_v1-echo-user-id_jack-echo-get
